@@ -7,13 +7,13 @@ OUTPUT_PATH = r"data/processed/complaints_clean.csv"
 SUMMARY_PATH = r"data/processed/data_quality_summary.txt"
 
 # 是否刪除完全相同的 complaint text
-DROP_DUPLICATE_COMPLAINT_TEXT = True
+DROP_DUPLICATE_COMPLAINT_TEXT = False
 
-# 抽樣數量
+# 抽樣數量；如果不想抽樣，改成 None
 SAMPLE_SIZE = 5000
 
 # complaint text 最短長度
-MIN_TEXT_LEN = 50
+MIN_TEXT_LEN = 80
 # =================================
 
 
@@ -89,9 +89,9 @@ def clean_data(
     df: pd.DataFrame,
     min_text_len: int = 80,
     sample_size: int | None = 5000,
-    drop_duplicate_complaint_text: bool = True
+    drop_duplicate_complaint_text: bool = False
 ) -> pd.DataFrame:
-    # 先只保留必要欄位
+    # 先只保留第一版需要的欄位
     keep_cols = [
         "product",
         "sub-product",
@@ -120,14 +120,14 @@ def clean_data(
     text_col = "consumer complaint narrative"
     df[text_col] = df[text_col].astype(str).str.strip()
 
-    # 核心欄位：缺失很少時可直接刪
-    # 這裡直接把核心欄位缺失/空值刪掉
-    core_cols = ["issue", "complaint id", "consumer complaint narrative"]
+    # 核心欄位：缺了就刪
+    core_cols = ["product", "issue", "complaint id", "consumer complaint narrative"]
 
-    # 先把真正 NaN 刪掉
+    # 先刪真正 NaN
     df = df.dropna(subset=core_cols)
 
     # 再刪空字串 / nan 字串
+    df = df[df["product"].astype(str).str.strip() != ""]
     df = df[df["issue"].astype(str).str.strip() != ""]
     df = df[df["complaint id"].astype(str).str.strip() != ""]
     df = df[df[text_col] != ""]
@@ -139,7 +139,6 @@ def clean_data(
     after = len(df)
     print(f"已移除 complaint text 長度 < {min_text_len} 的資料: {before - after:,}")
 
-    # 是否刪除重複 complaint text
     if drop_duplicate_complaint_text:
         before = len(df)
         df = df.drop_duplicates(subset=[text_col]).copy()
@@ -148,7 +147,6 @@ def clean_data(
 
     # 輔助欄位：可補 Unknown
     auxiliary_cols = [
-        "product",
         "sub-product",
         "sub-issue",
         "company public response",
@@ -162,8 +160,13 @@ def clean_data(
         df.loc[df[col] == "", col] = "Unknown"
         df.loc[df[col].str.lower() == "nan", col] = "Unknown"
 
-    # complaint id 統一轉字串
-    df["complaint id"] = df["complaint id"].astype(str).str.strip()
+    # complaint id 統一轉乾淨字串
+    df["complaint id"] = (
+        df["complaint id"]
+        .astype(str)
+        .str.replace(".0", "", regex=False)
+        .str.strip()
+    )
 
     # 建立可檢索文本
     def build_page_content(row):
@@ -173,9 +176,6 @@ def clean_data(
             f"Issue: {row['issue']}",
             f"Sub-issue: {row['sub-issue']}",
             f"Complaint: {row['consumer complaint narrative']}",
-            f"Company public response: {row['company public response']}",
-            f"Company response to consumer: {row['company response to consumer']}",
-            f"Company: {row['company']}",
         ]
         return "\n".join(parts)
 
