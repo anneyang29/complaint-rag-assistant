@@ -5,7 +5,8 @@ __pycache__/
 
 data/raw/
 data/processed/complaints_clean.csv
-data/
+data/processed/complaints_chunked.csv
+data/eval
 chroma_db/
 .env
 .DS_Store
