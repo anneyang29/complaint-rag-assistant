@@ -8,5 +8,6 @@ data/processed/complaints_clean.csv
 data/processed/complaints_chunked.csv
 data/eval
 chroma_db/
+chroma_chunk_db/
 .env
 .DS_Store

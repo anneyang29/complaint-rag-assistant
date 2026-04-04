@@ -2,15 +2,15 @@ import os
 import pandas as pd
 import numpy as np
 
-INPUT_PATH = r"data/eval/eval_labels.csv"
+INPUT_PATH = r"data/eval/eval_labels_llm_scored.csv"
 OUTPUT_PATH = r"data/eval/eval_metrics_summary.csv"
 
 
-def dcg_at_k(relevances, k):
+def dcg_at_k(final_relevance, k):
     """
     計算 DCG@k
     """
-    relevances = np.array(relevances[:k], dtype=float)
+    relevances = np.array(final_relevance[:k], dtype=float)
 
     if len(relevances) == 0:
         return 0.0
@@ -20,12 +20,12 @@ def dcg_at_k(relevances, k):
     return gains.sum()
 
 
-def ndcg_at_k(relevances, k):
+def ndcg_at_k(final_relevance, k):
     """
     計算 NDCG@k
     """
-    actual_dcg = dcg_at_k(relevances, k)
-    ideal_relevances = sorted(relevances, reverse=True)
+    actual_dcg = dcg_at_k(final_relevance, k)
+    ideal_relevances = sorted(final_relevance, reverse=True)
     ideal_dcg = dcg_at_k(ideal_relevances, k)
 
     if ideal_dcg == 0:
@@ -34,9 +34,9 @@ def ndcg_at_k(relevances, k):
     return actual_dcg / ideal_dcg
 
 
-def precision_at_k(relevances, k, relevant_threshold=1):
+def precision_at_k(final_relevance, k, relevant_threshold=1):
 
-    top_k = relevances[:k]
+    top_k = final_relevance[:k]
 
     if len(top_k) == 0:
         return 0.0
@@ -45,11 +45,11 @@ def precision_at_k(relevances, k, relevant_threshold=1):
     return relevant_count / k
 
 
-def hit_rate_at_k(relevances, k, relevant_threshold=1):
+def hit_rate_at_k(final_relevance, k, relevant_threshold=1):
     """
     top-k 中只要至少有一個 relevant
     """
-    top_k = relevances[:k]
+    top_k = final_relevance[:k]
     return 1.0 if any(r >= relevant_threshold for r in top_k) else 0.0
 
 
@@ -58,7 +58,7 @@ def evaluate_group(group_df, k_values=(3, 5)):
     對單一 query + retrieval_type 計算 metrics
     """
     group_df = group_df.sort_values("rank")
-    relevances = group_df["relevance"].tolist()
+    relevances = group_df["final_relevance"].tolist()
 
     result = {}
     for k in k_values:
@@ -81,7 +81,7 @@ def main():
         "retrieval_type",
         "rank",
         "result_id",
-        "relevance"
+        "final_relevance"
     ]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
@@ -89,7 +89,7 @@ def main():
 
     # 確保型別正確
     df["rank"] = df["rank"].astype(int)
-    df["relevance"] = df["relevance"].astype(int)
+    df["relevance"] = df["final_relevance"].astype(int)
     df["retrieval_type"] = df["retrieval_type"].astype(str)
 
     all_results = []
