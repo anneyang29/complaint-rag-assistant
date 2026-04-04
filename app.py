@@ -1,7 +1,9 @@
 import os
 import json
+import hashlib
 from collections import Counter
 
+import streamlit as st
 from openai import OpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
@@ -42,6 +44,7 @@ Style requirements:
 - Focus on what matters most for review
 - Do not repeat all retrieved cases
 - Write as if the reviewer only has 30 seconds to understand the case
+- Prefer quick triage logic before deep evidence requests
 
 Field requirements:
 
@@ -98,6 +101,31 @@ Hard rules:
 """.strip()
 
 
+# -----------------------------
+# Session State 初始化
+# -----------------------------
+DEFAULT_QUERY = "A merchant charged my credit card twice by mistake"
+
+if "selected_query" not in st.session_state:
+    st.session_state["selected_query"] = DEFAULT_QUERY
+
+if "analysis_result" not in st.session_state:
+    st.session_state["analysis_result"] = None
+
+if "case_results" not in st.session_state:
+    st.session_state["case_results"] = None
+
+if "chunk_results" not in st.session_state:
+    st.session_state["chunk_results"] = None
+
+if "last_analyzed_query" not in st.session_state:
+    st.session_state["last_analyzed_query"] = ""
+
+
+# -----------------------------
+# 資源載入
+# -----------------------------
+@st.cache_resource
 def load_case_vector_db():
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
     return Chroma(
@@ -106,6 +134,7 @@ def load_case_vector_db():
     )
 
 
+@st.cache_resource
 def load_chunk_vector_db():
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
     return Chroma(
@@ -124,17 +153,16 @@ def search_chunks(query: str, k: int = 5):
     return chunk_db.similarity_search_with_score(query, k=k)
 
 
+# -----------------------------
+# Prompt 輔助
+# -----------------------------
 def top_response_labels(case_results, top_n: int = 3):
     labels = []
     for doc, _ in case_results:
         label = doc.metadata.get("company_response_to_consumer")
         if label:
             labels.append(label)
-
-    if not labels:
-        return []
-
-    return [x for x, _ in Counter(labels).most_common(top_n)]
+    return [x for x, _ in Counter(labels).most_common(top_n)] if labels else []
 
 
 def top_issue_labels(case_results, chunk_results, top_n: int = 3):
@@ -149,19 +177,11 @@ def top_issue_labels(case_results, chunk_results, top_n: int = 3):
         sub_issue = doc.metadata.get("sub_issue")
         if issue:
             labels.append(f"{issue} | {sub_issue}")
-
-    if not labels:
-        return []
-
-    return [x for x, _ in Counter(labels).most_common(top_n)]
+    return [x for x, _ in Counter(labels).most_common(top_n)] if labels else []
 
 
 def detect_pattern_hints(case_results, chunk_results):
-    """
-    從 retrieved text 中抓一些弱訊號，讓 prompt 更穩。
-    """
     text_blob = []
-
     for doc, _ in case_results:
         text_blob.append(doc.page_content.lower())
     for doc, _ in chunk_results:
@@ -171,15 +191,15 @@ def detect_pattern_hints(case_results, chunk_results):
 
     keyword_map = {
         "temporary_credit": ["temporary credit", "provisional credit"],
-        "credit_reversed": ["reversed", "reversal", "reversed their temporary credits", "credit had been reversed"],
-        "duplicate_charge": ["charged twice", "duplicate", "rebilled", "same amount", "double charge", "twice in error"],
+        "credit_reversed": ["reversed", "reversal", "credit had been reversed"],
+        "duplicate_charge": ["charged twice", "duplicate", "rebilled", "same amount", "double charge"],
         "merchant_dispute": ["merchant", "refund", "purchase", "order", "separate bills", "separate orders"],
         "debt_not_mine": ["debt is not yours", "debt is not mine", "someone else's debt", "wrong person"],
-        "repeated_contact": ["keep calling", "repeated calls", "calls daily", "harassment", "still keep calling"],
-        "payment_misapplied": ["not applied", "applied incorrectly", "applied to principle", "applied to principal", "wrong account"],
-        "credit_report_error": ["credit report", "incorrect information", "wrong alias", "not mine", "hard inquiries"],
-        "claim_denied": ["denied", "nothing they could do", "closed with explanation", "claim was denied"],
-        "documents_or_verification": ["documentation", "documents", "verify", "verification", "receipts", "signed receipts"],
+        "repeated_contact": ["keep calling", "repeated calls", "calls daily", "harassment"],
+        "payment_misapplied": ["not applied", "applied incorrectly", "applied to principal", "wrong account"],
+        "credit_report_error": ["credit report", "incorrect information", "wrong alias", "hard inquiries"],
+        "claim_denied": ["denied", "nothing they could do", "closed with explanation"],
+        "documents_or_verification": ["documentation", "documents", "verify", "verification", "receipts"],
     }
 
     found = []
@@ -272,10 +292,10 @@ Instructions:
 - In actionable_checklist, order checks from quick verification first to deeper investigation later.
 - The first 2 checklist items must be fast checks that a reviewer can verify quickly.
 - Later checklist items may request merchant, issuer, or document evidence if supported by retrieved cases.
+- Prefer quick triage logic before deep evidence requests.
 - Do not invent certainty, future outcomes, or timelines.
 - Do not use numerical overlap percentages.
 - Sound like a short internal analyst note, not an encyclopedia entry.
-- Prefer quick triage logic before deep evidence requests.
 
 Return valid JSON only in this format:
 {{
@@ -296,10 +316,9 @@ Return valid JSON only in this format:
 def call_llm(prompt: str):
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise EnvironmentError("找不到 OPENAI_API_KEY，請先在 PowerShell 設定。")
+        raise EnvironmentError("找不到 OPENAI_API_KEY，請先設定。")
 
     client = OpenAI(api_key=api_key)
-
     response = client.responses.create(
         model=LLM_MODEL,
         input=[
@@ -312,101 +331,226 @@ def call_llm(prompt: str):
 
     try:
         data = json.loads(text)
-        required_keys = [
-            "complaint_pattern_summary",
-            "likely_issue_category",
-            "core_conflict_point",
-            "similarity_pivot",
-            "likely_review_paths",
-            "risk_alert",
-            "actionable_checklist",
-            "note",
-        ]
-        missing = [k for k in required_keys if k not in data]
-        if missing:
-            raise ValueError(f"缺少欄位: {missing}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM 回傳不是有效 JSON：{text}") from e
 
-        if not isinstance(data["actionable_checklist"], list):
-            raise ValueError("actionable_checklist 必須是 list")
+    required_keys = [
+        "complaint_pattern_summary",
+        "likely_issue_category",
+        "core_conflict_point",
+        "similarity_pivot",
+        "likely_review_paths",
+        "risk_alert",
+        "actionable_checklist",
+        "note",
+    ]
+    missing = [k for k in required_keys if k not in data]
+    if missing:
+        raise ValueError(f"缺少欄位: {missing}")
 
-        return data
-    except Exception as e:
-        raise ValueError(f"LLM JSON 解析失敗。\n原始輸出:\n{text}\n錯誤: {e}")
+    if not isinstance(data["actionable_checklist"], list):
+        raise ValueError("actionable_checklist 必須是 list")
 
-
-def print_output(query: str, case_results, chunk_results, llm_output: dict):
-    print("\n" + "=" * 120)
-    print("INVESTIGATION-STYLE RAG OUTPUT")
-    print("=" * 120)
-
-    print("\n[User Complaint]")
-    print(query)
-
-    print("\n[Likely Issue Category]")
-    print(llm_output["likely_issue_category"])
-
-    print("\n[Core Conflict Point]")
-    print(llm_output["core_conflict_point"])
-
-    print("\n[Similarity Pivot]")
-    print(llm_output["similarity_pivot"])
-
-    print("\n[Risk Alert]")
-    print(llm_output["risk_alert"])
-
-    print("\n[Likely Review Paths]")
-    print(llm_output["likely_review_paths"])
-
-    print("\n[Actionable Checklist]")
-    for item in llm_output["actionable_checklist"]:
-        print(f"- [ ] {item}")
-
-    print("\n[Complaint Pattern Summary]")
-    print(llm_output["complaint_pattern_summary"])
-
-    print("\n[Note]")
-    print(llm_output["note"])
-
-    print("\n" + "-" * 120)
-    print("[Top Similar Cases]")
-    for i, (doc, score) in enumerate(case_results, start=1):
-        print(f"\nCase {i} | score={score:.4f}")
-        print(f"complaint_id: {doc.metadata.get('complaint_id')}")
-        print(f"product: {doc.metadata.get('product')}")
-        print(f"issue: {doc.metadata.get('issue')}")
-        print(f"company: {doc.metadata.get('company')}")
-        print(f"company_response_to_consumer: {doc.metadata.get('company_response_to_consumer')}")
-        print(doc.page_content[:900])
-
-    print("\n" + "-" * 120)
-    print("[Top Evidence Chunks]")
-    for i, (doc, score) in enumerate(chunk_results, start=1):
-        print(f"\nChunk {i} | score={score:.4f}")
-        print(f"chunk_id: {doc.metadata.get('chunk_id')}")
-        print(f"complaint_id: {doc.metadata.get('complaint_id')}")
-        print(f"issue: {doc.metadata.get('issue')}")
-        print(doc.page_content[:700])
+    return data
 
 
-def main():
-    print("Investigation-Style Historical Handling Reference")
-    user_query = input("\n請輸入新的 complaint（若直接按 Enter，使用預設測試 query）: ").strip()
-
-    if not user_query:
-        user_query = "A merchant charged my credit card twice by mistake"
-
-    print("\n開始 retrieval...")
-    case_results = search_cases(user_query, k=3)
-    chunk_results = search_chunks(user_query, k=5)
-
-    print("開始組 prompt...")
-    prompt = build_prompt(user_query, case_results, chunk_results)
-
-    print("開始呼叫 LLM 生成結果...")
-    llm_output = call_llm(prompt)
-
-    print_output(user_query, case_results, chunk_results, llm_output)
+# -----------------------------
+# Checklist UI
+# -----------------------------
+def get_checklist_prefix(query: str) -> str:
+    return hashlib.md5(query.encode("utf-8")).hexdigest()[:12]
 
 
-if __name__ == "__main__":
-    main()
+def render_clickable_checklist(items, query: str):
+    prefix = get_checklist_prefix(query)
+
+    st.markdown("**Actionable Checklist**")
+
+    for i, item in enumerate(items):
+        state_key = f"{prefix}_check_{i}"
+        btn_key = f"{prefix}_btn_{i}"
+
+        if state_key not in st.session_state:
+            st.session_state[state_key] = False
+
+        col_btn, col_text = st.columns([0.16, 0.84], vertical_alignment="center")
+
+        with col_btn:
+            label = "Done" if st.session_state[state_key] else "To do"
+            if st.button(label, key=btn_key, use_container_width=True):
+                st.session_state[state_key] = not st.session_state[state_key]
+
+        with col_text:
+            if st.session_state[state_key]:
+                st.markdown(
+                    f"""
+                    <div style="
+                        padding: 0.8rem 1rem;
+                        border-radius: 12px;
+                        background: #f3f4f6;
+                        color: #6b7280;
+                        text-decoration: line-through;
+                        border: 1px solid #e5e7eb;
+                        margin-bottom: 0.5rem;
+                    ">
+                        {item}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f"""
+                    <div style="
+                        padding: 0.8rem 1rem;
+                        border-radius: 12px;
+                        background: #ffffff;
+                        color: #111827;
+                        border: 1px solid #d1d5db;
+                        margin-bottom: 0.5rem;
+                    ">
+                        {item}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+
+# -----------------------------
+# 頁面設定
+# -----------------------------
+st.set_page_config(page_title="Complaint Investigation RAG", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .main > div {
+        padding-top: 2rem;
+    }
+    .stButton>button {
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Complaint Investigation RAG")
+st.caption("Historical case retrieval + investigation-style analysis")
+
+
+# -----------------------------
+# Example 按鈕
+# -----------------------------
+example_cols = st.columns(3)
+examples = [
+    "A merchant charged my credit card twice by mistake",
+    "There are hard inquiries on my credit report that I did not authorize",
+    "The collection account on my file does not belong to me",
+]
+
+for idx, ex in enumerate(examples):
+    with example_cols[idx]:
+        if st.button(f"Use example {idx+1}", key=f"use_ex_{idx}", use_container_width=True):
+            st.session_state["selected_query"] = ex
+            st.session_state["analysis_result"] = None
+            st.session_state["case_results"] = None
+            st.session_state["chunk_results"] = None
+            st.session_state["last_analyzed_query"] = ""
+            st.rerun()
+
+
+# -----------------------------
+# 輸入框
+# -----------------------------
+query = st.text_area(
+    "Enter a new complaint",
+    key="selected_query",
+    height=140,
+    placeholder="Type a complaint here..."
+)
+
+run_btn = st.button("Analyze Complaint", use_container_width=True)
+
+
+# -----------------------------
+# 觸發分析
+# -----------------------------
+if run_btn:
+    if not query.strip():
+        st.warning("請先輸入 complaint。")
+    else:
+        with st.spinner("Running retrieval and generating analysis..."):
+            try:
+                case_results = search_cases(query, k=3)
+                chunk_results = search_chunks(query, k=5)
+                prompt = build_prompt(query, case_results, chunk_results)
+                llm_output = call_llm(prompt)
+
+                st.session_state["case_results"] = case_results
+                st.session_state["chunk_results"] = chunk_results
+                st.session_state["analysis_result"] = llm_output
+                st.session_state["last_analyzed_query"] = query
+
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"執行失敗：{e}")
+
+
+# -----------------------------
+# 顯示結果
+# -----------------------------
+if st.session_state["analysis_result"] is not None:
+    llm_output = st.session_state["analysis_result"]
+    case_results = st.session_state["case_results"]
+    chunk_results = st.session_state["chunk_results"]
+    analyzed_query = st.session_state["last_analyzed_query"]
+
+    st.subheader("Investigation Summary")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Likely Issue Category**")
+        st.write(llm_output["likely_issue_category"])
+
+        st.markdown("**Core Conflict Point**")
+        st.write(llm_output["core_conflict_point"])
+
+        st.markdown("**Risk Alert**")
+        st.write(llm_output["risk_alert"])
+
+    with c2:
+        st.markdown("**Similarity Pivot**")
+        st.write(llm_output["similarity_pivot"])
+
+        st.markdown("**Likely Review Paths**")
+        st.write(llm_output["likely_review_paths"])
+
+    render_clickable_checklist(llm_output["actionable_checklist"], analyzed_query)
+
+    st.markdown("**Complaint Pattern Summary**")
+    st.write(llm_output["complaint_pattern_summary"])
+
+    st.info(llm_output["note"])
+
+    with st.expander("Top Similar Cases", expanded=False):
+        for i, (doc, score) in enumerate(case_results, start=1):
+            st.markdown(f"### Case {i}")
+            st.write(f"**Score:** {score:.4f}")
+            st.write(f"**Complaint ID:** {doc.metadata.get('complaint_id')}")
+            st.write(f"**Product:** {doc.metadata.get('product')}")
+            st.write(f"**Issue:** {doc.metadata.get('issue')}")
+            st.write(f"**Company:** {doc.metadata.get('company')}")
+            st.write(f"**Company Response:** {doc.metadata.get('company_response_to_consumer')}")
+            st.code(doc.page_content[:1200], language="text")
+
+    with st.expander("Top Evidence Chunks", expanded=False):
+        for i, (doc, score) in enumerate(chunk_results, start=1):
+            st.markdown(f"### Chunk {i}")
+            st.write(f"**Score:** {score:.4f}")
+            st.write(f"**Chunk ID:** {doc.metadata.get('chunk_id')}")
+            st.write(f"**Complaint ID:** {doc.metadata.get('complaint_id')}")
+            st.write(f"**Issue:** {doc.metadata.get('issue')}")
+            st.code(doc.page_content[:900], language="text")
